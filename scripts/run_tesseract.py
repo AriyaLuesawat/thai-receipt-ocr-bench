@@ -6,12 +6,15 @@ EasyOCR-specific or a limit of non-VLM OCR on this data.
 
 Needs: `brew install tesseract`, then tha.traineddata and eng.traineddata from
 https://github.com/tesseract-ocr/tessdata_best in data/tessdata/ (or --tessdata).
-Output: results/tesseract/<split>/raw.jsonl with file, receipt_type, seconds, text
+Output: results/tesseract/<split>/raw.jsonl with file, receipt_type, seconds, text, and
+words (each recognised word with Tesseract's 0-100 confidence, used by quality_gate.py)
 """
 
 import argparse
+import csv
 import json
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -38,12 +41,21 @@ def main() -> None:
             if item["file"] in done:
                 continue
             start = time.perf_counter()
-            text = subprocess.run(
-                ["tesseract", str(data / "images" / item["file"]), "stdout", "-l", "tha+eng", "--psm", args.psm, "--tessdata-dir", args.tessdata],
-                capture_output=True, text=True, check=True,
-            ).stdout
+            with tempfile.TemporaryDirectory() as tmp:
+                # One call writes both the page text and a TSV with per-word confidence.
+                subprocess.run(
+                    ["tesseract", str(data / "images" / item["file"]), f"{tmp}/out", "-l", "tha+eng", "--psm", args.psm, "--tessdata-dir", args.tessdata, "-c", "tessedit_create_txt=1", "-c", "tessedit_create_tsv=1"],
+                    capture_output=True, text=True, check=True,
+                )
+                text = Path(f"{tmp}/out.txt").read_text(encoding="utf-8")
+                with open(f"{tmp}/out.tsv", encoding="utf-8", newline="") as f:
+                    words = [
+                        {"text": r["text"], "conf": round(float(r["conf"]), 1)}
+                        for r in csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
+                        if r["level"] == "5" and float(r["conf"]) >= 0 and (r["text"] or "").strip()
+                    ]
             seconds = time.perf_counter() - start
-            out.write(json.dumps({"file": item["file"], "receipt_type": item["receipt_type"], "seconds": round(seconds, 3), "text": text}, ensure_ascii=False) + "\n")
+            out.write(json.dumps({"file": item["file"], "receipt_type": item["receipt_type"], "seconds": round(seconds, 3), "text": text, "words": words}, ensure_ascii=False) + "\n")
             out.flush()
             if n % 50 == 0:
                 print(f"{n}/{len(items)}")

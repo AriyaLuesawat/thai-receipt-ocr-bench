@@ -58,7 +58,7 @@ Tesseract 5.5.4 (`tessdata_best` Thai + English), field extractor v3.
 3. **No engine is perfect on clean receipts.** Tesseract reads `3` as `2` in this font (`Cash: 702.00` for `703.00`) on 3 of 50 clean receipts, which EasyOCR reads correctly.
 4. **Most other misses come from misread labels, not misread numbers.** EasyOCR turns `change:` into `chance:` and `time:` into `tme:`. Matching labels by similarity raised noise1 time from 72% to 96% with no loss on clean receipts ([EXP-005](EXPERIMENTS.md#exp-005-rule-extractor-v2)).
 5. **"Take the largest amount" fails on receipts (12%).** That is the rule SaiJai uses for transfer slips, but on a receipt the cash paid is larger than the total.
-6. **OCR knows when it has failed.** Rejecting images with mean confidence below 0.3 caught 100% of failed images and 0% of good ones on this sample ([EXP-006](EXPERIMENTS.md#exp-006-quality-gate)). The threshold was chosen on the same data, so it still needs a held-out check, and it has not yet been ported to Tesseract.
+6. **OCR knows when it has failed, mostly.** For EasyOCR, rejecting images with mean confidence below 0.35 caught 100% of failed images and 0% of good ones, also on held-out images ([EXP-006](EXPERIMENTS.md#exp-006-quality-gate), [EXP-009](EXPERIMENTS.md#exp-009-quality-gate-for-tesseract-checked-on-held-out-images)). Tesseract stays confident when it is wrong, so a whole-image check barely works (margin 0.03). Checking confidence **per field** works better: keeping values with word confidence ≥ 0.77 raised the share of correct values on held-out images from 94.6% to 99.1%. The confident `3` → `2` misreads still get through, so the next step is an arithmetic check (cash − total = change).
 
 Every run, including the failed ones, is logged with its cause and the next step in **[EXPERIMENTS.md](EXPERIMENTS.md)**.
 
@@ -68,7 +68,7 @@ Every run, including the failed ones, is logged with its cause and the next step
 2. **OCR.** `scripts/run_easyocr.py` runs EasyOCR 1.7.2 with Thai and English models and saves every text box with its position and confidence. `scripts/run_tesseract.py` runs Tesseract 5 with the `tessdata_best` Thai and English models and saves the page text.
 3. **Field extraction.** `scripts/extract.py` groups boxes into lines and reads each field from the label next to it ("Total", "Cash", "Receipt No", ...). v1 needs the exact label. v2 matches labels by similarity and maps Thai digits and look-alike letters (`o`, `d` → `0`). v3 also accepts a label without its colon (`Cash 243.00`). For comparison, it also applies the rule SaiJai's slip backend uses for amounts: take the largest number with two decimals.
 4. **Scoring.** `scripts/evaluate.py` counts a field as correct only on an exact match (amounts within 0.005 baht), per noise level, and reports readable levels (clean–noise4) separately from the stress test (noise5–6).
-5. **Quality gate.** `scripts/quality_gate.py` checks whether OCR confidence and image sharpness can flag failed images before their numbers are trusted.
+5. **Quality gate.** `scripts/quality_gate.py` checks whether OCR confidence and image sharpness can flag failed images, or single wrong fields, before their numbers are trusted. The threshold is chosen on one half of the images and reported on the other half.
 
 ## Reproduce
 
@@ -87,6 +87,7 @@ Tesseract (`brew install tesseract`, then put `tha.traineddata` and `eng.trained
 ```bash
 .venv/bin/python scripts/run_tesseract.py --split bigc
 cd scripts && ../.venv/bin/python evaluate.py --engine tesseract --split bigc
+../.venv/bin/python quality_gate.py --engine tesseract --extractor rules_v3
 ```
 
 ## Data and license

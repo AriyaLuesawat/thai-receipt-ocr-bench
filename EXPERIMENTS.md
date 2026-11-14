@@ -14,6 +14,7 @@ Scores are exact-match field accuracy on the Big C sample (50 receipts per noise
 | EXP-006 | 2026-11-14 | Quality gate: detect failed OCR from its own confidence | Passed (in-sample): mean confidence < 0.3 rejects 100% of failed images and 0% of good ones. |
 | EXP-007 | 2026-11-14 | Replace EasyOCR with Tesseract 5 (Thai + English) | Passed: readable total 77% → 93%, noise4 total 0% → 84%, 3.5× faster. New weakness: reads `3` as `2` on some clean receipts. |
 | EXP-008 | 2026-11-14 | Rule extractor v3 (label colon optional) | Small pass: noise4 receipt no. 16% → 34% on Tesseract, no loss anywhere. |
+| EXP-009 | 2026-11-14 | Quality gate for Tesseract, checked on held-out images | Image-level gate passes on held-out but with a margin of only 0.03. Per-field gate passes: 99.1% of accepted values correct on held-out images. |
 
 ---
 
@@ -177,3 +178,49 @@ Readable averages for all six fields (v2): total 93%, cash 74%, change 84%, rece
 - **Passed, but small:** gains only where the colon was lost, no loss on any level for either engine.
 - **Still failing:** Tesseract noise4 cash is 6% because the `Cash` line is usually missing or garbled in the OCR text, not because the extractor misses it.
 - **Risk to watch:** without a colon, a label word followed by a number is a looser pattern. It still requires a fuzzy label match of at least 0.6, but needs checking on the Makro and bill layouts.
+
+## EXP-009: Quality gate for Tesseract, checked on held-out images
+
+- **Questions:** (1) does the EXP-006 gate hold on images it was not tuned on? (2) does it work for Tesseract?
+- **Change:** `scripts/run_tesseract.py` now also saves every word with Tesseract's 0–100 confidence (TSV output; the page text is unchanged, and the scores matched EXP-007/008 exactly). `scripts/quality_gate.py` splits the images into a *tune* half and a *test* half by a hash of the file name, chooses the threshold on tune, and reports on test. When several thresholds tie, it takes the middle one.
+- **Fixed on the way:** the first rerun crashed because `txt`/`tsv` are config files that live in Tesseract's own tessdata folder, not in `data/tessdata/`. Passing `-c tessedit_create_txt=1 -c tessedit_create_tsv=1` avoids the config files.
+
+**1. Image-level gate (reject the whole image when mean confidence is low)**
+
+| Engine | threshold (chosen on tune) | failed rejected, test half | good rejected, test half | margin between groups |
+| --- | ---: | ---: | ---: | ---: |
+| EasyOCR | 0.35 | 100% (75/75) | 0% (0/61) | 0.38 |
+| Tesseract | 0.90 | 100% (64/64) | 0% (0/66) | **0.03** |
+
+- **EasyOCR passed on held-out images.** The EXP-006 caveat is cleared for this dataset: the lowest-confidence good image (0.55) sits far above the highest-confidence failed one (0.16).
+- **Tesseract passed, but only just.** Tesseract stays confident when it is wrong: noise4 has median word confidence 0.85, against 0.93 on clean. The good and failed groups are only 0.03 apart, so a slightly different image source could break the threshold.
+- **It also throws away good data.** It rejects every noise4 image, yet Tesseract reads the total right on 84% of them. An image-level gate is the wrong unit for an engine that half-works.
+
+**2. Per-field gate (accept or reject each value on its own)**
+
+For each extracted value, find the OCR word that contains it and take that word's confidence. Keep the value only if the confidence is above a threshold, otherwise ask the user to check that one field.
+
+| keep field if conf ≥ | fields kept (of 1,419) | correct among kept | wrong let through | correct thrown away |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 (no gate) | 1,419 | 95.0% | 71 | 0 |
+| 0.70 | 1,306 | 98.2% | 23 | 65 |
+| 0.80 | 1,241 | 99.0% | 12 | 119 |
+| 0.90 | 1,087 | 99.7% | 3 | 264 |
+| 0.95 | 782 | 100.0% | 0 | 566 |
+
+Held-out check: the lowest threshold with at least 99% correct on the tune half is 0.77. On the test half (94.6% correct with no gate) it keeps 544 of 611 values, 99.1% of them correct (5 wrong let through, 39 correct thrown away).
+
+| Level (threshold 0.77) | values extracted | correct | kept | wrong among kept |
+| --- | ---: | ---: | ---: | ---: |
+| clean | 300 | 297 | 299 | 3 |
+| noise1 | 288 | 279 | 275 | 3 |
+| noise2 | 284 | 281 | 259 | 1 |
+| noise3 | 300 | 298 | 297 | 1 |
+| noise4 | 118 | 98 | 79 | 2 |
+| noise5 (stress) | 129 | 95 | 57 | 2 |
+
+- **Passed:** wrong values on held-out images drop from 5.4% to 0.9% with no extra model, on images the threshold was not chosen on. noise4 is no longer all-or-nothing: 79 of its values are kept (77 right) instead of the whole image being rejected.
+- **What still gets through:** the three clean `3` → `2` misreads from EXP-007 (`702.00` for `703.00`). Tesseract is confident about them, so no confidence gate can catch them. Catching these needs a cross-check, for example total = sum of items, or cash − total = change.
+- **Limitation:** the value-to-word match is by digits only, so a value that also appears elsewhere on the receipt (e.g. a total equal to an item price) may take the wrong word's confidence.
+
+**Next:** add arithmetic cross-checks (cash − total = change, sum of items = total) to catch confident misreads, then try a Thai VLM.
