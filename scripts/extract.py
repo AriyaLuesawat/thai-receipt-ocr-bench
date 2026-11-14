@@ -163,3 +163,46 @@ def extract_rules_v2(item: dict) -> dict:
 
 
 EXTRACTORS = {"rules": extract_rules, "rules_v2": extract_rules_v2, "largest_amount": extract_largest_amount}
+
+
+# ─── v3: label colon optional (EXP-008) ──────────────────────────────────────
+# Tesseract on blurred receipts often drops the colon ("Cash 243.00", "Recept No 000141"),
+# and v2 only accepts "word:". v3 also accepts a label word followed directly by a digit.
+LABEL_TOKEN_V3 = re.compile(r"([A-Za-z!|=1@#$%^&*]{2,10})\s*\.?\s*(?:[:;]|(?=\d))")
+
+
+def find_after_v3(lines: list[str], label: str, threshold: float = 0.6) -> str | None:
+    best, best_rest = threshold, None
+    for line in lines:
+        compact = re.sub(r"\s+(?=[A-Za-z])", "", line.lower()) if label == "receiptno" else line.lower()
+        for m in LABEL_TOKEN_V3.finditer(compact):
+            token = re.sub(r"[^a-z]", "", m.group(1))
+            score = _similar(token, label) if token else 0.0
+            if score > best:
+                best, best_rest = score, compact[m.end():]
+    return best_rest
+
+
+def extract_rules_v3(item: dict) -> dict:
+    lines = [normalise_digits(l) for l in item_lines(item)]
+    fields = extract_rules_v2(item)
+    for field in ("total", "cash", "change"):
+        if fields[field] is None:
+            rest = find_after_v3(lines, LABELS[field])
+            if rest is not None:
+                fields[field] = parse_amount_v2(rest.split("ref")[0])
+    if fields["receipt_no"] is None:
+        rest = find_after_v3(lines, LABELS["receipt_no"])
+        if rest is not None:
+            m = re.search(r"\d{4,}", rest.translate(DIGIT_FIX_V2))
+            fields["receipt_no"] = m.group(0) if m else None
+    if fields["receipt_time"] is None:
+        rest = find_after_v3(lines, LABELS["receipt_time"])
+        if rest is not None:
+            m = re.search(r"(\d{1,2})\s*[:.;]\s*(\d{2})", rest.translate(DIGIT_FIX_V2))
+            if m:
+                fields["receipt_time"] = f"{int(m.group(1)):02d}:{m.group(2)}"
+    return fields
+
+
+EXTRACTORS["rules_v3"] = extract_rules_v3

@@ -12,6 +12,8 @@ Scores are exact-match field accuracy on the Big C sample (50 receipts per noise
 | EXP-004 | 2026-11-14 | Upscale and sharpen before OCR on noise4 | Failed: 0/10 at every setting. Sharpening also hurt noise1. |
 | EXP-005 | 2026-11-14 | Rule extractor v2 (fuzzy labels, Thai digits) | Passed: noise1 time 72% → 96%, receipt no. 82% → 96%, change 46% → 68%. No loss on clean. |
 | EXP-006 | 2026-11-14 | Quality gate: detect failed OCR from its own confidence | Passed (in-sample): mean confidence < 0.3 rejects 100% of failed images and 0% of good ones. |
+| EXP-007 | 2026-11-14 | Replace EasyOCR with Tesseract 5 (Thai + English) | Passed: readable total 77% → 93%, noise4 total 0% → 84%, 3.5× faster. New weakness: reads `3` as `2` on some clean receipts. |
+| EXP-008 | 2026-11-14 | Rule extractor v3 (label colon optional) | Small pass: noise4 receipt no. 16% → 34% on Tesseract, no loss anywhere. |
 
 ---
 
@@ -124,3 +126,54 @@ Rule: reject when mean confidence < t. "Good" = at least 5 of 6 fields right (14
   - The threshold was chosen on the same 350 images it is scored on. It needs a held-out check.
   - In this synthetic data, an image either works or fails completely, which makes separation easy. Real photos will have partial failures (one smudged number on an otherwise clear receipt). A per-field confidence will be needed for those.
 - **Next:** check the gate on held-out images and on real receipts, and try per-field confidence.
+
+## EXP-007: Tesseract instead of EasyOCR
+
+- **Question:** is the noise4 failure a limit of classic (non-VLM) OCR on blurred receipts, or specific to EasyOCR?
+- **Setup:** Tesseract 5.5.4 (LSTM) with the `tessdata_best` Thai and English models, page segmentation mode 6, no preprocessing, same 350 images. Script: `scripts/run_tesseract.py`. Fields from the same extractor v2, so only the OCR engine changed.
+
+| Level | EasyOCR total | Tesseract total | EasyOCR change | Tesseract change | EasyOCR receipt no. | Tesseract receipt no. | EasyOCR s/img | Tesseract s/img |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| clean | 100% | 100% | 100% | 100% | 100% | 100% | 5.5 | 1.6 |
+| noise1 | 86% | 86% | 68% | **98%** | 96% | **100%** | 4.7 | 1.6 |
+| noise2 | 98% | 96% | 82% | **92%** | 98% | 94% | 4.9 | 1.6 |
+| noise3 | 100% | 100% | 100% | 100% | 98% | **100%** | 4.8 | 1.5 |
+| noise4 | 0% | **84%** | 0% | **28%** | 0% | **16%** | 8.6 | 1.9 |
+| noise5 (stress) | 0% | 52% | 0% | 20% | 0% | 2% | 9.3 | 2.0 |
+| noise6 (stress) | 0% | 0% | 0% | 0% | 0% | 0% | 7.9 | 2.7 |
+| **Readable** | 77% | **93%** | 70% | **84%** | 78% | **82%** | 5.7 | **1.6** |
+
+Readable averages for all six fields (v2): total 93%, cash 74%, change 84%, receipt no. 82%, date 82%, time 81%.
+
+**What passed**
+
+- **noise4 is no longer 0%.** Tesseract reads blurred English and digits well enough: `Total: 1816.50`, `Change 0.00`, `Time: 15:11`. So the blur is not beyond classic OCR. EasyOCR's text detector is what breaks on it (EXP-002).
+- **About 3.5× faster** on CPU (1.6 s against 5.7 s per image).
+- **Better on change** for noise1–2 (68% → 98% and 82% → 92%).
+
+**What failed, and why**
+
+- **noise4, fields other than total are still low** (cash 0%, date 10%). Looking at the text:
+  - The colon after the label is often lost: `Cash 243.00`, `Recept No 000141`. Extractor v2 needs `word:`, so it skips these lines. This part is an extractor problem → EXP-008.
+  - Digits and separators are misread: `000149` for `000169`, `2209/2025` (slash lost), `Change: 1000` for `10.00` (decimal point lost). This part is OCR and the extractor cannot fix it safely.
+  - The `Cash` line is sometimes missing from the output altogether.
+- **Clean cash is 94%, not 100%.** Three clean receipts read `Cash: 702.00` for `703.00`, `362.00` for `363.00`, `892.00` for `893.00`. EasyOCR reads the same three correctly. Tesseract confuses `3` with `2` in this font even when the image is sharp, so a 100% clean score cannot be assumed for any engine.
+- **noise6 (pixelated) is still 0%** for both engines.
+- **No confidence signal yet.** The EXP-006 quality gate uses EasyOCR box confidence. Tesseract's word confidence needs `tsv` output, not plain text, before the gate can be ported.
+
+**Next:** relax the label colon (EXP-008), then port the quality gate to Tesseract confidence. Check whether a Thai VLM (Typhoon OCR) fixes the remaining digit errors.
+
+## EXP-008: Rule extractor v3
+
+- **Change:** v2 only accepts a label written as `word:`. v3 also accepts a label word followed directly by a digit (`Cash 243.00`). v3 only runs where v2 found nothing, so it cannot change a field v2 already read.
+
+| Engine / level | cash v2 → v3 | change v2 → v3 | receipt no. v2 → v3 | total v2 → v3 |
+| --- | --- | --- | --- | --- |
+| Tesseract noise4 | 0% → 6% | 28% → 34% | 16% → **34%** | 84% → 84% |
+| Tesseract noise5 (stress) | 20% → 30% | 20% → **62%** | 2% → 2% | 52% → 64% |
+| EasyOCR noise1 | 72% → 78% | 68% → 68% | 96% → 98% | 86% → 86% |
+| Every other level, both engines | no change | | | |
+
+- **Passed, but small:** gains only where the colon was lost, no loss on any level for either engine.
+- **Still failing:** Tesseract noise4 cash is 6% because the `Cash` line is usually missing or garbled in the OCR text, not because the extractor misses it.
+- **Risk to watch:** without a colon, a label word followed by a number is a looser pattern. It still requires a fuzzy label match of at least 0.6, but needs checking on the Makro and bill layouts.
