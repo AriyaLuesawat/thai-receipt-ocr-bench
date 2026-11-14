@@ -58,7 +58,7 @@ def main() -> None:
         seconds[level] += item["seconds"]
         record = {"file": item["file"], "receipt_type": level}
         for name, extractor in EXTRACTORS.items():
-            predicted = extractor(item["boxes"])
+            predicted = extractor(item)
             for field, value in predicted.items():
                 ok = correct(field, value, label.get(field))
                 hits[level][f"{name}:{field}"] += ok
@@ -71,7 +71,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    columns = ["largest_amount:total"] + [f"rules:{f}" for f in FIELDS]
+    columns = ["largest_amount:total"] + [f"{name}:{f}" for name in ("rules", "rules_v2") for f in FIELDS]
     levels = sorted(counts, key=level_key)
     groups = {
         "READABLE (clean–noise4)": [l for l in levels if not is_stress(l)],
@@ -92,7 +92,7 @@ def main() -> None:
         for level, n, sec, values in table:
             writer.writerow([level, n, round(sec, 2), *[round(v, 4) for v in values]])
 
-    header = ["noise level", "n", "s/img", "total (largest)", *[f.replace("receipt_", "") for f in FIELDS]]
+    header = ["noise level", "n", "s/img", "total (largest)", *[f"{f.replace('receipt_', '')} v1" for f in FIELDS], *[f"{f.replace('receipt_', '')} v2" for f in FIELDS]]
     print("| " + " | ".join(header) + " |")
     print("|" + "---|" * len(header))
     for level, n, sec, values in table:

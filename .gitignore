@@ -5,3 +5,4 @@ __pycache__/
 .env
 .DS_Store
 results/samples/
+results/**/raw.jsonl
