@@ -15,6 +15,7 @@ Scores are exact-match field accuracy on the Big C sample (50 receipts per noise
 | EXP-007 | 2026-11-14 | Replace EasyOCR with Tesseract 5 (Thai + English) | Passed: readable total 77% → 93%, noise4 total 0% → 84%, 3.5× faster. New weakness: reads `3` as `2` on some clean receipts. |
 | EXP-008 | 2026-11-14 | Rule extractor v3 (label colon optional) | Small pass: noise4 receipt no. 16% → 34% on Tesseract, no loss anywhere. |
 | EXP-009 | 2026-11-14 | Quality gate for Tesseract, checked on held-out images | Image-level gate passes on held-out but with a margin of only 0.03. Per-field gate passes: 99.1% of accepted values correct on held-out images. |
+| EXP-010 | 2026-11-14 | Arithmetic cross-checks (cash − total = change, items sum = total) | Passed: on Tesseract, wrong amounts accepted 9 → 1 (of about 650). Every confirmed or repaired value is correct, on both engines. |
 
 ---
 
@@ -224,3 +225,47 @@ Held-out check: the lowest threshold with at least 99% correct on the tune half 
 - **Limitation:** the value-to-word match is by digits only, so a value that also appears elsewhere on the receipt (e.g. a total equal to an item price) may take the wrong word's confidence.
 
 **Next:** add arithmetic cross-checks (cash − total = change, sum of items = total) to catch confident misreads, then try a Thai VLM.
+
+## EXP-010: Arithmetic cross-checks
+
+- **Problem:** confidence cannot catch values OCR misreads *confidently*: Tesseract reads `703.00` as `702.00` with high confidence (EXP-009).
+- **Idea:** a receipt contains its own redundancy, so the amounts can check each other without another model. Script: `scripts/cross_check.py`.
+  - **C1:** cash − total = change
+  - **C2:** sum of item prices = total (item prices are the trailing amounts of the lines between the date line and the `Total` line)
+  - **Sanity:** cash ≥ total, and an amount must be payable in Thai currency (a multiple of 0.25 baht, the smallest coin)
+- **Each amount gets a status:** *confirmed* (part of a check that holds), *repaired* (missing or broken, recomputed from confirmed values), *flagged* (a check fails and cannot be resolved, so the user is asked), or *unchecked* (not enough values for any check, so the EXP-009 confidence gate decides).
+
+**Iterations inside this experiment**
+
+1. **First version: repaired by confidence.** When C1 failed but C2 confirmed the total, the lower-confidence of cash/change was recomputed. On Tesseract this fixed all three clean `702.00` misreads, but on EasyOCR it made 4 values wrong. In `bigc_noise2_06247`, EasyOCR read change `50.00` as `0.00`, and the rule "fixed" the correct cash `157.00` to `107.00`. Confidence ties and near-ties made the choice a coin flip.
+2. **Item prices with a lost decimal point.** Only 137 of 350 item lists were read completely, because Tesseract drops the point on some prices (`5200` for `52.00`). On a line that starts with a quantity, a bare trailing number of 3+ digits is now read as having two decimals. A wrong guess can only make C2 fail, never create a false confirmation. Complete item lists: 137 → 202.
+3. **Final: repair only when the broken value is impossible.** When C1 fails, repair only if exactly one of cash/change is not payable (`215.03` cannot be paid, so it must be the misread). Otherwise flag both and ask the user. Also flag when cash < total. This loses the three automatic clean-cash repairs on Tesseract (they are now flagged instead), but removes every wrong repair.
+
+**Result (final version, amount fields only: total, cash, change; 350 receipts × 3 = 1,050 fields)**
+
+| Engine | Policy | accepted | wrong among accepted | asked the user |
+| --- | --- | ---: | ---: | ---: |
+| Tesseract | confidence gate only (EXP-009, 0.77) | 656 | 9 | — |
+| Tesseract | **cross-checks + confidence for unchecked** | 647 | **1** | 107 |
+| EasyOCR | confidence gate only (0.77) | 211 | 3 | — |
+| EasyOCR | **cross-checks + confidence for unchecked** | 511 | **0** | 67 |
+
+| Status (Tesseract) | values | correct | wrong |
+| --- | ---: | ---: | ---: |
+| confirmed | 570 | 570 | 0 |
+| repaired | 11 | 11 | 0 |
+| unchecked, confidence ≥ 0.77 (accepted) | 66 | 65 | 1 |
+| unchecked, low confidence (asked) | 32 | 23 | 9 |
+| flagged (asked) | 75 | 52 | 23 |
+
+On EasyOCR, all 497 confirmed and 13 repaired values are also correct.
+
+- **Passed:** a value that passes an arithmetic check was right every time on both engines (1,091 values). Cross-checks also help EasyOCR, whose confidence scale differs from Tesseract's: it accepts 511 values instead of 211, with no errors.
+- **Accuracy gains are small, trust gains are large.** Readable accuracy on Tesseract moves only a little (cash 75% → 77%, change 85% → 86%). The real change is that the app can now say which numbers it is sure of.
+- **What still fails:**
+  - **noise4 gets almost no checks** (1 confirmed value of 150). Tesseract usually loses the `Cash` line and most item lines there, so neither C1 nor C2 can run. Those values fall back to the confidence gate.
+  - **The one wrong value accepted:** `bigc_noise5_05263`, total read as `303.00` (true `343.00`) with cash and change both missing, so no check could run and the confidence was high.
+  - **Flagged includes many correct values** (52 of 75): when a check fails, the code cannot tell which value is wrong, so it asks about all of them. That costs the user a tap, not a wrong number.
+- **Caveat:** these rules were designed while looking at this same sample. They have no tuned threshold, but the payable rule was added after seeing two EasyOCR failures. They need a check on another layout (Makro tax invoices) to show they generalise.
+
+**Next:** test on the Makro split, whose tax invoices add VAT (subtotal + VAT = total) as a third check. Then try a Thai VLM on noise4, where the checks have nothing to work with.
