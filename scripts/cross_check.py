@@ -135,6 +135,24 @@ def check(values: dict, items: list[float] | None, conf: dict, vat_total: float 
     return out, status
 
 
+def check_item(item: dict, extracted: dict) -> tuple:
+    """Run the checks on one OCR result: (values read, final values, status, confidence, items, vat_total)."""
+    words = item.get("words") or [{"text": b["text"], "conf": b["conf"] * 100} for b in item.get("boxes", [])]
+    values = {f: float(extracted[f]) if extracted.get(f) not in (None, "") else None for f in AMOUNTS}
+    conf = {f: field_conf(words, f, str(v)) for f, v in values.items() if v is not None}
+    lines = [thai_normalise(l) for l in item_lines(item)]
+    vat_total = None
+    if is_makro(lines):
+        items = makro_item_amounts(lines)
+        row = makro_vat_row(lines)
+        if row and eq(row[0] + row[1], row[2]):  # C3: amount before VAT + VAT = total
+            vat_total = row[2]
+    else:
+        items = item_amounts(item_lines(item))
+    final, status = check(values, items, conf, vat_total)
+    return values, final, status, conf, items, vat_total
+
+
 def receipt_no_status(lines: list[str]) -> str:
     """Makro prints the 12-digit receipt number twice. Both copies equal -> confirmed."""
     copies = re.findall(r"(?<![\d-])(\d{12})(?![\d-])", "\n".join(lines).translate(DIGIT_FIX_V2))
@@ -159,19 +177,9 @@ def main() -> None:
     for line in (run / "raw.jsonl").open(encoding="utf-8"):
         item = json.loads(line)
         p = per_image[item["file"]]
-        words = item.get("words") or [{"text": b["text"], "conf": b["conf"] * 100} for b in item.get("boxes", [])]
-        values = {f: float(p[f"{args.extractor}:{f}"]) if p[f"{args.extractor}:{f}"] else None for f in AMOUNTS}
-        conf = {f: field_conf(words, f, str(v)) for f, v in values.items() if v is not None}
+        extracted = {f: p[f"{args.extractor}:{f}"] for f in AMOUNTS}
+        values, final, status, conf, items, vat_total = check_item(item, extracted)
         lines = [thai_normalise(l) for l in item_lines(item)]
-        vat_total = None
-        if is_makro(lines):
-            items = makro_item_amounts(lines)
-            row = makro_vat_row(lines)
-            if row and eq(row[0] + row[1], row[2]):  # C3: amount before VAT + VAT = total
-                vat_total = row[2]
-        else:
-            items = item_amounts(item_lines(item))
-        final, status = check(values, items, conf, vat_total)
         receipt_status = receipt_no_status(lines) if is_makro(lines) else "unchecked"
         label = truth[item["file"]]
         row = {"file": item["file"], "receipt_type": item["receipt_type"], "n_items_read": len(items or []), "n_items_true": len(label["items"]),

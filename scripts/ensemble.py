@@ -49,19 +49,24 @@ def same(a: str, b: str) -> bool:
         return a.strip() == b.strip()
 
 
+def decide_amount(sa: str, va: str, sb: str, vb: str) -> tuple[str, int]:
+    """Decision for one amount from (status, value) of two passes: ("checked" | "agree" | "flagged", pass used)."""
+    ca, cb = sa in CHECKED, sb in CHECKED
+    if ca and cb and not same(va, vb):
+        return "flagged", -1
+    if ca:
+        return "checked", 0
+    if cb:
+        return "checked", 1
+    if same(va, vb):
+        return "agree", 0
+    return "flagged", -1
+
+
 def combine_amount(a: dict, b: dict, f: str) -> tuple[str, int | None]:
     """Return (decision, correct) for one amount field; correct is None when not accepted."""
-    ca, cb = a[f + ":status"] in CHECKED, b[f + ":status"] in CHECKED
-    va, vb = a[f + ":after"], b[f + ":after"]
-    if ca and cb and not same(va, vb):
-        return "flagged", None
-    if ca:
-        return "checked", int(a[f + ":ok_after"])
-    if cb:
-        return "checked", int(b[f + ":ok_after"])
-    if same(va, vb):
-        return "agree", int(a[f + ":ok_after"])
-    return "flagged", None
+    decision, used = decide_amount(a[f + ":status"], a[f + ":after"], b[f + ":status"], b[f + ":after"])
+    return decision, None if used < 0 else int((a, b)[used][f + ":ok_after"])
 
 
 def possible(field: str, value: str) -> bool:

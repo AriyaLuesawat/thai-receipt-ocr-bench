@@ -4,7 +4,7 @@ How accurately can OCR systems read the fields that matter on Thai receipts (tot
 
 This project measures that on the [nectec/thairocr](https://huggingface.co/datasets/nectec/thairocr) dataset, which provides synthetic Thai receipts with full JSON ground truth at seven noise levels (a clean render plus `noise1`–`noise6`).
 
-> Status: work in progress. Two OCR engines (EasyOCR and Tesseract), rule-based field extraction, and self-checks have been tested on two receipt layouts: 350 Big C slips and 350 Makro A4 tax invoices. Next: a Thai vision-language model for blurred images, and a check against real receipts.
+> Status: work in progress. Two OCR engines (EasyOCR and Tesseract), rule-based field extraction, and self-checks have been tested on two receipt layouts: 350 Big C slips and 350 Makro A4 tax invoices. The best setup runs as an HTTP API with a demo page ([Try it locally](#try-it-locally)). Next: deploy it, check it on real receipts, and try a Thai vision-language model for blurred images.
 
 ## Results so far
 
@@ -82,6 +82,33 @@ In the last two rows a value counts only if it is correct *and* accepted. Everyt
 
 Every run, including the failed ones, is logged with its cause and the next step in **[EXPERIMENTS.md](EXPERIMENTS.md)**.
 
+## Try it locally
+
+The best setup from the benchmark (two Tesseract passes, layout-aware rules, arithmetic checks, voting) runs as a FastAPI service. Each field comes back with how far to trust it:
+
+| Status | Meaning | On the benchmark |
+| --- | --- | ---: |
+| `verified` | an arithmetic check that holds includes the value | 1,050 of 1,051 correct |
+| `agreed` | two independent reads give the same value | 1,017 of 1,027 correct |
+| `needs_review` | not enough evidence; the user confirms or corrects | — |
+
+```bash
+brew install tesseract          # plus tha/eng tessdata_best models in data/tessdata/ (see Reproduce)
+.venv/bin/pip install -r requirements-app.txt
+.venv/bin/uvicorn app.main:app --port 8010
+# open http://localhost:8010, or:
+curl -F file=@receipt.jpg http://localhost:8010/read
+```
+
+```json
+{"layout": "slip", "seconds": 1.08, "fields": {
+  "total":  {"value": 2991.0, "status": "verified", "candidates": ["2991.0"]},
+  "change": {"value": 0.0,    "status": "verified", "candidates": ["0.0"]},
+  "receipt_date": {"value": "23/09/2025", "status": "agreed", "candidates": ["23/09/2025"]}, "...": "..."}}
+```
+
+Median time per image on an Apple M5 CPU: 1.1 s for a Big C slip, 3.8 s for a Makro A4 invoice. Uploaded images are deleted after the response, and the log records only timing and status counts. `tests/` checks that the API makes the same decisions the benchmark scored, on all 700 images ([EXP-016](EXPERIMENTS.md#exp-016-from-benchmark-scripts-to-a-service)). A `Dockerfile` for a Hugging Face Space is included but not yet built.
+
 ## Method
 
 1. **Sample.** `scripts/fetch_subset.py` takes 50 receipts per noise level from the `bigc` split (350 images), using one contiguous window at a seeded random offset inside each 1,000-row block. Only the sample is downloaded, not the full 14.6 GB dataset.
@@ -91,6 +118,7 @@ Every run, including the failed ones, is logged with its cause and the next step
 5. **Quality gate.** `scripts/quality_gate.py` checks whether OCR confidence and image sharpness can flag failed images, or single wrong fields, before their numbers are trusted. The threshold is chosen on one half of the images and reported on the other half.
 6. **Cross-checks.** `scripts/cross_check.py` checks the amounts against each other (cash − total = change, sum of items = total, before-VAT + VAT = total on Makro, cash ≥ total, payable to 0.25 baht) and marks each one confirmed, repaired, flagged, or unchecked. Makro receipt numbers are printed twice, so the two copies are compared too.
 7. **Two passes.** `scripts/run_tesseract.py --preprocess clahe` reads each image again after contrast enhancement, and `scripts/ensemble.py` keeps, per field, a value a check confirmed in either pass, or one both passes agree on. For receipt no., date and time (`--rule vote`), it also rejects impossible dates and times and accepts a Makro receipt number when its two printed copies match.
+8. **Service.** `scripts/pipeline.py` runs steps 2–7 on one image (the two passes in parallel), and `app/main.py` serves it over HTTP. `tests/` pins the check rules and verifies that the pipeline reproduces the benchmark's decisions.
 
 ## Reproduce
 
@@ -125,6 +153,13 @@ for e in tesseract tesseract-clahe; do
   ../.venv/bin/python cross_check.py --engine $e --split makro --extractor rules_v4
 done
 ../.venv/bin/python ensemble.py --split makro
+```
+
+Tests (the consistency tests are skipped when `data/` and the OCR outputs are missing):
+
+```bash
+.venv/bin/pip install -r requirements-app.txt
+.venv/bin/python -m pytest tests
 ```
 
 ## Data and license

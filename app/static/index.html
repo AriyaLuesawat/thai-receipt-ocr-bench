@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thai Receipt Reader</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e3e3de;
+    --accent: #2f5d8a; --ok: #2e7d4f; --ok-bg: #e5f3ea; --agree: #2f5d8a; --agree-bg: #e6eef7;
+    --warn: #9a5b00; --warn-bg: #fdf0dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --card: #1f1f1d; --text: #ececea; --muted: #a0a09a; --line: #34342f;
+      --accent: #8db4dc; --ok: #7fcf9e; --ok-bg: #1f3428; --agree: #8db4dc; --agree-bg: #1e2a37;
+      --warn: #f0b860; --warn-bg: #3a2c14;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Sukhumvit Set", "Noto Sans Thai", sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 1.3fr; gap: 20px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  label.drop { display: block; border: 2px dashed var(--line); border-radius: 10px; padding: 28px 12px; text-align: center; cursor: pointer; color: var(--muted); }
+  label.drop:hover { border-color: var(--accent); }
+  input[type=file] { display: none; }
+  img#preview { width: 100%; margin-top: 12px; border-radius: 8px; display: none; }
+  button { margin-top: 12px; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: var(--accent); color: var(--card); font-weight: 600; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 10px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  td.name { color: var(--muted); width: 30%; }
+  td.val input { width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: .78rem; font-weight: 600; white-space: nowrap; }
+  .verified { color: var(--ok); background: var(--ok-bg); }
+  .agreed { color: var(--agree); background: var(--agree-bg); }
+  .needs_review { color: var(--warn); background: var(--warn-bg); }
+  tr.needs_review input { border-color: var(--warn); }
+  .meta { color: var(--muted); font-size: .9rem; margin-top: 10px; }
+  .legend { color: var(--muted); font-size: .88rem; margin-top: 14px; }
+  .legend div { margin: 4px 0; }
+  .error { color: var(--warn); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Thai Receipt Reader</h1>
+  <p class="lead">Reads total, cash, change, receipt no., date and time from a Thai receipt, and says how far to trust each value. อ่านใบเสร็จ และบอกว่าค่าไหนเชื่อได้ ค่าไหนควรตรวจเอง</p>
+  <div class="grid">
+    <div class="card">
+      <label class="drop" for="file">Choose a receipt image (JPEG / PNG)<br>เลือกรูปใบเสร็จ</label>
+      <input id="file" type="file" accept="image/jpeg,image/png,image/webp">
+      <img id="preview" alt="Selected receipt">
+      <button id="go" disabled>Read receipt</button>
+      <div class="meta">The image is processed and deleted; nothing is stored.</div>
+    </div>
+    <div class="card">
+      <table id="result"><tbody></tbody></table>
+      <div class="meta" id="meta">No receipt read yet.</div>
+      <div class="legend">
+        <div><span class="badge verified">verified</span> an arithmetic check holds (cash − total = change, items, VAT)</div>
+        <div><span class="badge agreed">agreed</span> two independent reads give the same value</div>
+        <div><span class="badge needs_review">check</span> not enough evidence. Please confirm or correct</div>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+  const NAMES = { total: "Total ยอดรวม", cash: "Cash เงินสด", change: "Change เงินทอน",
+                  receipt_no: "Receipt no. เลขที่", receipt_date: "Date วันที่", receipt_time: "Time เวลา" };
+  const LABEL = { verified: "verified", agreed: "agreed", needs_review: "check" };
+  const fileInput = document.getElementById("file"), go = document.getElementById("go");
+  const preview = document.getElementById("preview"), body = document.querySelector("#result tbody");
+  const meta = document.getElementById("meta");
+
+  fileInput.addEventListener("change", () => {
+    const f = fileInput.files[0];
+    go.disabled = !f;
+    if (f) { preview.src = URL.createObjectURL(f); preview.style.display = "block"; }
+  });
+
+  function show(fields) {
+    body.replaceChildren();
+    for (const [key, v] of Object.entries(fields)) {
+      const tr = document.createElement("tr");
+      tr.className = v.status;
+      const name = document.createElement("td"); name.className = "name"; name.textContent = NAMES[key] || key;
+      const val = document.createElement("td"); val.className = "val";
+      const input = document.createElement("input");
+      const shown = v.value ?? v.candidates[0] ?? "";
+      input.value = typeof shown === "number" ? shown.toFixed(2) : shown;
+      if (v.candidates.length > 1) {
+        const list = document.createElement("datalist"); list.id = "c-" + key;
+        for (const c of v.candidates) { const o = document.createElement("option"); o.value = c; list.append(o); }
+        input.setAttribute("list", list.id); val.append(list);
+      }
+      val.append(input);
+      const st = document.createElement("td");
+      const badge = document.createElement("span"); badge.className = "badge " + v.status; badge.textContent = LABEL[v.status];
+      st.append(badge);
+      tr.append(name, val, st); body.append(tr);
+    }
+  }
+
+  go.addEventListener("click", async () => {
+    const form = new FormData(); form.append("file", fileInput.files[0]);
+    go.disabled = true; meta.textContent = "Reading… (two OCR passes, about 3–5 s)";
+    try {
+      const r = await fetch("/read", { method: "POST", body: form });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || r.statusText);
+      show(data.fields);
+      const review = Object.values(data.fields).filter(v => v.status === "needs_review").length;
+      meta.textContent = `Layout: ${data.layout} · ${data.seconds} s · ${review} field(s) to check`;
+    } catch (e) {
+      meta.innerHTML = ""; const s = document.createElement("span"); s.className = "error"; s.textContent = "Error: " + e.message; meta.append(s);
+    } finally { go.disabled = false; }
+  });
+</script>
+</body>
+</html>

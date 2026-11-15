@@ -21,6 +21,7 @@ Scores are exact-match field accuracy on the Big C sample (50 receipts per noise
 | EXP-013 | 2026-11-15 | CLAHE contrast preprocessing before Tesseract | Mixed: Makro faded total 0% → 84%, blur 0% → 44%, but crumpled change 84% → 0%. Helps some images, hurts others. |
 | EXP-014 | 2026-11-15 | Read every image twice (raw + CLAHE), let the checks choose. Plus a bug fix in the checks | Passed: Big C 1 wrong value accepted in 1,500 readable fields. Makro total 54% → 66%. Bug: cash was marked confirmed without any check (14 wrong values under CLAHE), now fixed. |
 | EXP-015 | 2026-11-15 | Vote on receipt no., date, time: possible-value rules + the two printed receipt-number copies | Passed: Makro readable receipt no. 38% → 50%, Big C readable wrong values 1 → 0, all-level wrong 14 → 11. First try (majority of 4 reads) failed: 6 → 9 wrong on Makro. |
+| EXP-016 | 2026-11-15 | Per-image pipeline + FastAPI service and demo page | Passed: the pipeline reproduces the benchmark decisions on all 700 images (tested). Latency median 1.1 s (Big C), 3.8 s (Makro) per image on CPU. Docker image written but not built yet. |
 
 ---
 
@@ -450,4 +451,29 @@ For comparison, single-pass Tesseract on Makro readable got total 54%, cash 56%,
 - **Lesson:** the number of reads does not matter; the number of *independent* reads does. Two passes over the same pixels count as about one read.
 
 **Next:** make the pipeline usable outside the benchmark: an API that takes a photo and returns each field with its status (EXP-016).
+
+## EXP-016: From benchmark scripts to a service
+
+- **Goal:** the benchmark scripts work on whole folders and CSV files. A user has one photo. Turn the best setup (two Tesseract passes, rules v4, checks, vote) into one function and an HTTP API, without changing what was measured.
+- **Refactor:** `run_tesseract.ocr()`, `cross_check.check_item()` and `ensemble.decide_amount()` were split out of the batch loops, and `scripts/pipeline.py` chains them for one image. The two OCR passes run in parallel threads (each is its own Tesseract process).
+- **How I checked that nothing changed:**
+  - After the refactor, all `cross_check.csv` files were regenerated and are byte-identical to the committed ones. 7 images re-OCR'd with the new `ocr()` gave identical text and word confidences.
+  - `tests/test_pipeline.py` runs the per-image pipeline on the stored OCR of all 700 benchmark images. Every amount gets the same decision as `ensemble.py`, and scoring the pipeline's accepted values against the labels gives exactly EXP-015's wrong counts (3 on Big C, 8 on Makro).
+  - Unit tests pin the rules that earlier bugs broke: a lone cash value must stay unchecked (EXP-014), unpayable values, cash below total, impossible dates and times. 17 tests pass.
+- **API** (`app/main.py`): `POST /read` takes an image and returns each field with `value`, `status` (`verified`, `agreed`, `needs_review`) and `candidates` (what each pass read, for the user to choose from). `GET /health` reports the Tesseract version and whether the Thai model is installed. `GET /` is a small upload page that shows the statuses and lets the user correct flagged fields.
+- **Input safety:** uploads over 10 MB or with a side over 4,000 px are refused (413); bytes that do not decode as an image are refused (415). The image is decoded and re-encoded with OpenCV before Tesseract sees it, processed in a temporary folder, and deleted after the response. The log keeps only layout, time and status counts, never field values.
+
+**Latency** (through HTTP, 3 images per noise level, Apple M5 CPU, both passes in parallel)
+
+| Layout | images | median | p90 | max |
+| --- | ---: | ---: | ---: | ---: |
+| Big C slip | 21 | 1.11 s | 1.69 s | 1.90 s |
+| Makro A4 invoice | 21 | 3.76 s | 4.78 s | 4.99 s |
+
+- **Passed:** one call returns what the benchmark measured, with a trust level per field. Running the passes in parallel keeps the two-pass cost close to one pass (the same Makro image: 4.9 s with the passes one after the other, 2.6 s in parallel).
+- **Not done yet:**
+  - The `Dockerfile` (for a Hugging Face Docker Space) has not been built: Docker is not installed on this machine. Debian ships Tesseract 5.3 while the benchmark used 5.5.4, so the scores must be rechecked inside the image before quoting them for the deployed version.
+  - No real phone photos have gone through it. Real photos are rotated, cropped and lit unevenly, which the synthetic data does not cover.
+
+**Next:** build and deploy the image, then feed it real receipts and log the results as a new split.
 
