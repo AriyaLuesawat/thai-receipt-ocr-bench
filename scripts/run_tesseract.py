@@ -18,6 +18,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import cv2
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -27,6 +29,8 @@ def main() -> None:
     parser.add_argument("--tessdata", default=str(ROOT / "data" / "tessdata"))
     parser.add_argument("--psm", default="6", help="page segmentation mode (6 = one uniform block of text)")
     parser.add_argument("--engine-name", default="tesseract", help="results folder name, to keep variants apart")
+    parser.add_argument("--preprocess", choices=["none", "clahe"], default="none",
+                        help="clahe: grayscale + local contrast equalisation, for faded text (EXP-013)")
     args = parser.parse_args()
 
     data = ROOT / "data" / args.split
@@ -42,9 +46,14 @@ def main() -> None:
                 continue
             start = time.perf_counter()
             with tempfile.TemporaryDirectory() as tmp:
+                image = data / "images" / item["file"]
+                if args.preprocess == "clahe":
+                    gray = cv2.imread(str(image), cv2.IMREAD_GRAYSCALE)
+                    image = Path(tmp) / "in.png"
+                    cv2.imwrite(str(image), cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16)).apply(gray))
                 # One call writes both the page text and a TSV with per-word confidence.
                 subprocess.run(
-                    ["tesseract", str(data / "images" / item["file"]), f"{tmp}/out", "-l", "tha+eng", "--psm", args.psm, "--tessdata-dir", args.tessdata, "-c", "tessedit_create_txt=1", "-c", "tessedit_create_tsv=1"],
+                    ["tesseract", str(image), f"{tmp}/out", "-l", "tha+eng", "--psm", args.psm, "--tessdata-dir", args.tessdata, "-c", "tessedit_create_txt=1", "-c", "tessedit_create_tsv=1"],
                     capture_output=True, text=True, check=True,
                 )
                 text = Path(f"{tmp}/out.txt").read_text(encoding="utf-8")

@@ -5,6 +5,7 @@ A confidence gate cannot catch values OCR misreads *confidently* (Tesseract read
 
   C1  cash - total = change
   C2  sum of item prices = total      (item lines are read from the OCR text)
+  C3  amount before VAT + VAT = total (Makro tax invoices: footer TOTAL row)
   plus two sanity rules: cash >= total, and amounts must be payable (multiples of 0.25 baht)
 
 For each receipt the three amounts (total, cash, change) get one status each:
@@ -25,8 +26,9 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from evaluate import correct, is_stress, level_key
-from extract import DIGIT_FIX_V2, LABEL_TOKEN_V3, _similar, item_lines, normalise_digits
+from evaluate import canonical_label, correct, is_stress, level_key
+from extract import (DIGIT_FIX_V2, LABEL_TOKEN_V3, _similar, is_makro, item_lines, makro_item_amounts,
+                     makro_vat_row, normalise_digits, thai_normalise)
 from quality_gate import field_conf
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -69,10 +71,15 @@ def item_amounts(lines: list[str]) -> list[float] | None:
     return amounts or None
 
 
-def check(values: dict, items: list[float] | None, conf: dict) -> tuple[dict, dict]:
-    """Return (final values, status per amount field)."""
+def check(values: dict, items: list[float] | None, conf: dict, vat_total: float | None = None) -> tuple[dict, dict]:
+    """Return (final values, status per amount field).
+
+    `items` gives one independent estimate of the total (C2). `vat_total` gives another (C3,
+    Makro only): the footer row's total, used only when its own net + VAT adds up.
+    """
     t, c, g = values["total"], values["cash"], values["change"]
-    s = round(sum(items), 2) if items else None
+    witnesses = ([round(sum(items), 2)] if items else []) + ([vat_total] if vat_total is not None else [])
+    s = next((w for w in witnesses if t is not None and eq(w, t)), witnesses[0] if witnesses else None)
     out = dict(values)
     status = {f: "unchecked" for f in AMOUNTS}
 
@@ -97,14 +104,17 @@ def check(values: dict, items: list[float] | None, conf: dict) -> tuple[dict, di
                 status["change" if wrong == "cash" else "cash"] = "confirmed"
             else:
                 status.update(cash="flagged", change="flagged")
-        elif c is not None:
-            out["change"], status["cash"], status["change"] = round(c - t, 2), "confirmed", "repaired"
-        elif g is not None:
-            out["cash"], status["change"], status["cash"] = round(t + g, 2), "confirmed", "repaired"
+        # With only one of cash/change read, nothing checks that value, so it stays unchecked
+        # and the missing one is not derived from it. (Until EXP-014 it was marked confirmed
+        # and used to derive the other; that let 7 wrong values through on Makro + CLAHE.)
         if out["change"] is not None and out["change"] < -EPS:
             status.update(cash="flagged", change="flagged")
+        for f in ("cash", "change"):
+            if status[f] == "unchecked" and values[f] is not None and not payable(values[f]):
+                status[f] = "flagged"
         return out, status
 
+    s = next((w for w in witnesses if c is not None and g is not None and eq(c - g, w)), s)
     if s is not None and c is not None and g is not None and eq(c - g, s):
         # Total missing or misread, but cash - change matches the items: total = items sum.
         out["total"] = s
@@ -113,11 +123,24 @@ def check(values: dict, items: list[float] | None, conf: dict) -> tuple[dict, di
 
     # Some check could run but failed, and nothing resolves it. Also: cash below the total
     # is impossible, even when change is missing and C1 cannot run.
-    if None not in (t, c, g) or (s is not None and t is not None) or (t is not None and c is not None and c < t - EPS):
+    if None not in (t, c, g) or (witnesses and t is not None) or (t is not None and c is not None and c < t - EPS):
         for f in AMOUNTS:
             if values[f] is not None:
                 status[f] = "flagged"
+    # An amount paid in cash must be payable (multiple of 0.25 baht). On Makro, a misread
+    # label sometimes returns the pre-VAT amount (279.44 instead of 299.00), which this catches.
+    for f in AMOUNTS:
+        if status[f] == "unchecked" and values[f] is not None and not payable(values[f]):
+            status[f] = "flagged"
     return out, status
+
+
+def receipt_no_status(lines: list[str]) -> str:
+    """Makro prints the 12-digit receipt number twice. Both copies equal -> confirmed."""
+    copies = re.findall(r"(?<![\d-])(\d{12})(?![\d-])", "\n".join(lines).translate(DIGIT_FIX_V2))
+    if len(copies) >= 2:
+        return "confirmed" if copies[0] == copies[1] else "flagged"
+    return "single"
 
 
 def main() -> None:
@@ -129,7 +152,7 @@ def main() -> None:
     args = parser.parse_args()
 
     run = ROOT / "results" / args.engine / args.split
-    truth = {json.loads(l)["file"]: json.loads(l)["label"] for l in (ROOT / "data" / args.split / "labels.jsonl").open(encoding="utf-8")}
+    truth = {json.loads(l)["file"]: canonical_label(json.loads(l)["label"]) for l in (ROOT / "data" / args.split / "labels.jsonl").open(encoding="utf-8")}
     per_image = {r["file"]: r for r in csv.DictReader((run / "per_image.csv").open(encoding="utf-8"))}
 
     rows = []
@@ -139,10 +162,21 @@ def main() -> None:
         words = item.get("words") or [{"text": b["text"], "conf": b["conf"] * 100} for b in item.get("boxes", [])]
         values = {f: float(p[f"{args.extractor}:{f}"]) if p[f"{args.extractor}:{f}"] else None for f in AMOUNTS}
         conf = {f: field_conf(words, f, str(v)) for f, v in values.items() if v is not None}
-        items = item_amounts(item_lines(item))
-        final, status = check(values, items, conf)
+        lines = [thai_normalise(l) for l in item_lines(item)]
+        vat_total = None
+        if is_makro(lines):
+            items = makro_item_amounts(lines)
+            row = makro_vat_row(lines)
+            if row and eq(row[0] + row[1], row[2]):  # C3: amount before VAT + VAT = total
+                vat_total = row[2]
+        else:
+            items = item_amounts(item_lines(item))
+        final, status = check(values, items, conf, vat_total)
+        receipt_status = receipt_no_status(lines) if is_makro(lines) else "unchecked"
         label = truth[item["file"]]
-        row = {"file": item["file"], "receipt_type": item["receipt_type"], "n_items_read": len(items or []), "n_items_true": len(label["items"])}
+        row = {"file": item["file"], "receipt_type": item["receipt_type"], "n_items_read": len(items or []), "n_items_true": len(label["items"]),
+               "vat_check": int(vat_total is not None), "receipt_no:status": receipt_status,
+               "receipt_no:ok": int(correct("receipt_no", p[f"{args.extractor}:receipt_no"] or None, label.get("receipt_no")))}
         for f in AMOUNTS:
             # Without a check, fall back to the per-field confidence gate.
             if status[f] == "unchecked" and final[f] is not None:
@@ -178,6 +212,14 @@ def main() -> None:
     for st in ("confirmed", "repaired", "unchecked_kept", "unchecked_low_conf", "flagged"):
         n, ok = by_status.get(st, [0, 0])
         print(f"| {st} | {n} | {ok} | {n - ok} |")
+
+    # Makro prints the receipt number twice (English and Thai header lines): agreement check.
+    if any(r["receipt_no:status"] != "unchecked" for r in rows):
+        print("\n| receipt no. (printed twice) | receipts | correct |\n|---|---:|---:|")
+        for st in ("confirmed", "flagged", "single"):
+            rs = [r for r in rows if r["receipt_no:status"] == st]
+            print(f"| {st} | {len(rs)} | {sum(r['receipt_no:ok'] for r in rs)} |")
+        print(f"VAT row usable (net + VAT = total): {sum(r['vat_check'] for r in rows)}/{len(rows)}")
 
     # 3. Final policy: accept confirmed, repaired and unchecked_kept; ask the user for the rest.
     accepted = [(r[f + ":ok_after"]) for r in rows for f in AMOUNTS if r[f + ":status"] in ("confirmed", "repaired", "unchecked_kept")]

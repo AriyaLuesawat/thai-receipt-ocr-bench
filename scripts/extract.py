@@ -206,3 +206,85 @@ def extract_rules_v3(item: dict) -> dict:
 
 
 EXTRACTORS["rules_v3"] = extract_rules_v3
+
+
+# ─── v4: detects the layout, adds Makro tax invoices (EXP-012) ───────────────
+# Makro prints A4 tax invoices with Thai labels (รวมเงิน, ทอน, เวลา), dd-mm-yyyy dates,
+# 12-digit receipt numbers, and a "TOTAL" row that is the amount *before* VAT, so the
+# Big C rules read the wrong total there (EXP-011). Big C receipts still go to v3.
+THAI_FIX = (("ํา", "ำ"), ("ํ", ""))  # Tesseract splits sara am (ำ) into nikhahit + sara aa
+MAKRO_MARKERS = ("แม็คโคร", "makro", "legal amount", "ใบกำกับภาษี", "cashier", "พนักงานเก็บเงิน")
+
+
+def thai_normalise(text: str) -> str:
+    for old, new in THAI_FIX:
+        text = text.replace(old, new)
+    return normalise_digits(text)
+
+
+def is_makro(lines: list[str]) -> bool:
+    text = " ".join(lines).lower()
+    return sum(marker in text for marker in MAKRO_MARKERS) >= 2
+
+
+def amount_after_token(lines: list[str], label: str, threshold: float = 0.7) -> float | None:
+    """First amount after the whitespace token most similar to `label` (Thai or English)."""
+    best, best_amount = threshold, None
+    for line in lines:
+        tokens = line.split()
+        for i, token in enumerate(tokens):
+            score = _similar(token.lower(), label.lower())
+            if score > best:
+                amount = parse_amount_v2(" ".join(tokens[i + 1:i + 3]))
+                if amount is not None:
+                    best, best_amount = score, amount
+    return best_amount
+
+
+def makro_vat_row(lines: list[str]) -> tuple[float, float, float] | None:
+    """(amount before VAT, VAT, total) from the footer row that starts with TOTAL."""
+    for line in lines:
+        m = re.search(r"t[o0]ta[l1i]", line, re.IGNORECASE)
+        if not m:
+            continue
+        amounts = [parse_amount_v2(a) for a in re.findall(r"\d[\d,]*[.,]\d{2}", line[m.end():].translate(DIGIT_FIX_V2))]
+        if len(amounts) >= 3 and None not in amounts[:3]:
+            return amounts[0], amounts[1], amounts[2]
+    return None
+
+
+def makro_item_amounts(lines: list[str]) -> list[float] | None:
+    """Last amount on each item line (an item line holds a 12-16 digit article number)."""
+    amounts = []
+    for line in lines:
+        fixed = line.translate(DIGIT_FIX_V2)
+        if re.search(r"\b\d{12,16}\b", fixed) and not re.search(r"(?i)pos|tax|ภาษี|ใบเสร็จ|receipt", line):
+            found = re.findall(r"\d[\d,]*[.,]\d{2}", fixed)
+            if found:
+                amounts.append(float(found[-1].replace(",", "")))
+    return amounts or None
+
+
+def extract_makro(lines: list[str]) -> dict:
+    fields: dict = {f: None for f in FIELDS}
+    fields["total"] = amount_after_token(lines, "รวมเงิน") or amount_after_token(lines, "ยอดเงินชำระ")
+    fields["cash"] = amount_after_token(lines, "cash")
+    fields["change"] = amount_after_token(lines, "ทอน", threshold=0.99)
+    text = "\n".join(lines).translate(DIGIT_FIX_V2)
+    m = re.search(r"(?<![\d-])(\d{12})(?![\d-])", text)
+    fields["receipt_no"] = m.group(1) if m else None
+    m = re.search(r"(\d{2})\s*[-/.]\s*(\d{2})\s*[-/.]\s*(20\d{2})", text)
+    if m:
+        fields["receipt_date"] = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    m = re.search(r"(?:เวลา|time)\s*[:.]?\s*(\d{1,2})\s*[:.;]\s*(\d{2})", text, re.IGNORECASE)
+    if m:
+        fields["receipt_time"] = f"{int(m.group(1)):02d}:{m.group(2)}"
+    return fields
+
+
+def extract_rules_v4(item: dict) -> dict:
+    lines = [thai_normalise(l) for l in item_lines(item)]
+    return extract_makro(lines) if is_makro(lines) else extract_rules_v3(item)
+
+
+EXTRACTORS["rules_v4"] = extract_rules_v4

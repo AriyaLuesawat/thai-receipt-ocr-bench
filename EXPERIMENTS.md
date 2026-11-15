@@ -2,7 +2,7 @@
 
 Every run is recorded here, including the ones that failed: what was tried, what happened, why it passed or failed, and what changed next. Newest entries are at the bottom.
 
-Scores are exact-match field accuracy on the Big C sample (50 receipts per noise level). "Readable" means clean–noise4, the levels a person can still read. noise5–6 are a stress test (see EXP-002).
+Scores are exact-match field accuracy on the Big C sample (50 receipts per noise level), and from EXP-011 on the Makro sample too. "Readable" means clean–noise4, the levels a person can still read. noise5–6 are a stress test (see EXP-002).
 
 | ID | Date | What | Result |
 | --- | --- | --- | --- |
@@ -16,6 +16,10 @@ Scores are exact-match field accuracy on the Big C sample (50 receipts per noise
 | EXP-008 | 2026-11-14 | Rule extractor v3 (label colon optional) | Small pass: noise4 receipt no. 16% → 34% on Tesseract, no loss anywhere. |
 | EXP-009 | 2026-11-14 | Quality gate for Tesseract, checked on held-out images | Image-level gate passes on held-out but with a margin of only 0.03. Per-field gate passes: 99.1% of accepted values correct on held-out images. |
 | EXP-010 | 2026-11-14 | Arithmetic cross-checks (cash − total = change, items sum = total) | Passed: on Tesseract, wrong amounts accepted 9 → 1 (of about 650). Every confirmed or repaired value is correct, on both engines. |
+| EXP-011 | 2026-11-15 | Big C rules on Makro tax invoices, unchanged | Failed as expected: total, change and date 0%. The Big C rules read the pre-VAT `TOTAL` row and miss Thai labels. |
+| EXP-012 | 2026-11-15 | Extractor v4 (layout detection + Makro rules) and VAT/receipt-number checks | Partial pass: readable total 0% → 54%, clean 100%. Checks hold up on the new layout (3 wrong of 397 accepted), but 2 confirmed values were wrong: a correlated misread passes C1. |
+| EXP-013 | 2026-11-15 | CLAHE contrast preprocessing before Tesseract | Mixed: Makro faded total 0% → 84%, blur 0% → 44%, but crumpled change 84% → 0%. Helps some images, hurts others. |
+| EXP-014 | 2026-11-15 | Read every image twice (raw + CLAHE), let the checks choose. Plus a bug fix in the checks | Passed: Big C 1 wrong value accepted in 1,500 readable fields. Makro total 54% → 66%. Bug: cash was marked confirmed without any check (14 wrong values under CLAHE), now fixed. |
 
 ---
 
@@ -269,3 +273,138 @@ On EasyOCR, all 497 confirmed and 13 repaired values are also correct.
 - **Caveat:** these rules were designed while looking at this same sample. They have no tuned threshold, but the payable rule was added after seeing two EasyOCR failures. They need a check on another layout (Makro tax invoices) to show they generalise.
 
 **Next:** test on the Makro split, whose tax invoices add VAT (subtotal + VAT = total) as a third check. Then try a Thai VLM on noise4, where the checks have nothing to work with.
+
+> **Correction (found in EXP-014):** when only the total was confirmed (by the items) and change was missing, this version marked cash as *confirmed* and derived change from it, although nothing had checked cash. On Big C every one of those cash values happened to be right, so the tables above show no errors, but the logic was wrong, and on Makro with CLAHE it let 14 wrong values through. After the fix, Tesseract on Big C accepts 636 amounts with 1 wrong (was 647 with 1 wrong); the conclusions here are unchanged.
+
+## EXP-011: Big C rules on Makro tax invoices
+
+- **Question:** do the extractor and checks, built only on Big C, work on a different layout? This is the generalisation test EXP-005 and EXP-010 asked for.
+- **Data:** 350 Makro tax invoices from `nectec/thairocr` (`makro` split, 50 per level, same sampling). These are A4 pages (2480 × 3508 px), not narrow slips. Labels are Thai (`รวมเงิน` total, `ทอน` change, `เวลา` time), dates are `dd-mm-yyyy`, receipt numbers have 12 digits and are printed twice, and a footer `TOTAL` row holds the amount before VAT, the VAT, and the total. `scripts/evaluate.py` gained `canonical_label()` to map the nested Makro labels to the six scored fields.
+- **OCR:** Tesseract, same settings. 3.8 s per page.
+
+| Level | total | cash | change | receipt no. | date | time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| clean | 0% | 100% | 0% | 94% | 0% | 96% |
+| noise1 | 0% | 90% | 0% | 12% | 0% | 2% |
+| noise2 | 0% | 90% | 0% | 80% | 0% | 80% |
+| **Readable (clean–noise4)** | **0%** | 56% | **0%** | 37% | **0%** | 36% |
+
+- **Failed, for the reasons expected:**
+  - **total 0%:** the fuzzy `total` label matches the footer `TOTAL` row, whose first amount is the price *before* VAT (`TOTAL 45.79 3.21 49.00` for a 49.00 bill). This is a wrong value, not a missing one, which is the dangerous kind.
+  - **change 0%:** the label is the Thai word `ทอน`. v3 only matches Latin labels.
+  - **date 0%:** v3 only looks for `dd/mm/yyyy`.
+- **What did transfer:** `CASH` is in English on both layouts (90–100%), and the receipt number and time partly match through the English header line.
+- **Lesson:** label rules do not generalise across stores by themselves, and a fuzzy label can silently pick a different quantity with the same name.
+
+## EXP-012: Extractor v4 and Makro checks
+
+- **Change:** `extract_rules_v4` first detects the layout from the text (at least two of `แม็คโคร`, `makro`, `LEGAL AMOUNT`, `ใบกำกับภาษี`, `CASHIER`, `พนักงานเก็บเงิน`). Makro pages get their own rules, and anything else goes to v3. The Makro rules:
+  - match whole Thai tokens by similarity (`รวมเงิน` for the total, falling back to `ยอดเงินชำระ`; `ทอน`; `CASH`);
+  - repair Tesseract's split sara am (`ํา` → `ำ`) before matching;
+  - read `dd-mm-yyyy` dates, the 12-digit receipt number, and `เวลา` / `TIME` for the time.
+- **New checks in `scripts/cross_check.py`:**
+  - **C3:** amount before VAT + VAT = total on the footer row. This gives a second independent estimate of the total, next to the item sum.
+  - **Receipt number printed twice:** if both 12-digit copies agree, the number is confirmed.
+- **Bugs fixed along the way:**
+  - Makro article numbers can have 15 digits, so only 27 of 350 item lists were found at first. Accepting 12–16 digits raised that to 124.
+  - Some misread labels returned the pre-VAT amount as the total (`279.44` for `299.00`, and 279.44 × 1.07 = 299.00). The payable rule from EXP-010 now also applies to values no check could reach. It flagged all 10 such cases, and wrong values that passed the confidence gate fell from 11 to 1.
+- **Big C is unchanged:** v4 gives exactly the same output as v3 on all 350 Big C receipts, for both engines.
+
+| Level | total v3 → v4 | cash | change v3 → v4 | receipt no. v3 → v4 | date v3 → v4 | time v3 → v4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| clean | 0% → **100%** | 100% | 0% → **100%** | 94% → 94% | 0% → **82%** | 96% → 98% |
+| noise1 (crumpled) | 0% → **84%** | 90% | 0% → **84%** | 12% → 14% | 0% → **76%** | 2% → 0% |
+| noise2 (paper texture) | 0% → **86%** | 90% | 0% → **66%** | 80% → 80% | 0% → **86%** | 80% → 90% |
+| noise3 (faded, yellow) | 0% → 0% | 0% | 0% → 0% | 0% → 26% | 0% → 10% | 0% → 20% |
+| noise4 (blur) | 0% → 0% | 0% | 0% → 0% | 0% → 0% | 0% → 0% | 0% → 8% |
+| **Readable** | 0% → **54%** | 56% | 0% → **50%** | 37% → 43% | 0% → **51%** | 36% → 43% |
+
+**Cross-checks on Makro (amount fields, 1,050)**
+
+| Policy | accepted | wrong among accepted | asked the user |
+| --- | ---: | ---: | ---: |
+| confidence gate only (0.77, tuned on Big C) | 353 | 16 | — |
+| **cross-checks + payable rule + confidence** | 397 | **3** | 51 |
+
+| Status | values | correct | wrong |
+| --- | ---: | ---: | ---: |
+| confirmed | 375 | 373 | **2** |
+| repaired | 10 | 10 | 0 |
+| unchecked, accepted | 12 | 11 | 1 |
+| unchecked, low confidence (asked) | 5 | 3 | 2 |
+| flagged (asked) | 46 | 14 | 32 |
+
+| Receipt no. (printed twice) | receipts | correct |
+| --- | ---: | ---: |
+| both copies agree (confirmed) | 79 | **79** |
+| copies disagree (flagged) | 40 | 16 |
+| only one copy read | 113 | 12 |
+
+**What passed**
+
+- The checks carried over to a layout they were not designed on. Wrong accepted amounts fell from 16 to 3.
+- The duplicate receipt number is a strong check: all 79 agreeing pairs were right.
+- The confidence threshold tuned on Big C does *not* transfer (16 wrong with the gate alone). The arithmetic and payable rules have no tuned threshold, which is why they held up better.
+
+**What failed, and why**
+
+- **Two wrong "confirmed" values, the first ones in the project.** In `makro_noise2_06276`, Tesseract read the same digit wrong in both total and cash (`3047` → `3007`, `3340` → `3300`). Their difference, the change of 293, stays correct, so C1 holds. A check that subtracts two numbers cannot see an error shared by both. C2 or C3 would have caught it (items sum 3047), but only 4 of the 5 items were read, so neither check could run. **Lesson:** "confirmed" means "consistent", and the strongest claim needs two independent checks, not one.
+- **noise3 (faded yellow) is 0%, unlike Big C, where it was easy.** The A4 page is much paler, and Tesseract loses the labels while still finding some amounts. Contrast preprocessing is tested in EXP-013.
+- **noise4 (blur) is 0%.** The page is easy for a person to read at full size, but Tesseract returns noise. Downscaling to 50% or 35%, and page segmentation modes 3, 4 and 11, did not help (tried on 6 images). This is the case left for a VLM.
+- **noise1 time is 0%:** the time is small header text, and the crumpled texture breaks its digits (`TIME 10.4`, `เวลา 5:6`).
+- **The VAT row was usable on only 87 of 350 pages,** and complete item lists were found on 124. On degraded pages these long table rows lose digits first.
+
+**Next:** contrast preprocessing for faded pages (EXP-013). Then require two independent checks before marking a total "confirmed".
+
+## EXP-013: CLAHE contrast preprocessing
+
+- **Why:** Makro noise3 (faded, yellow) was 0%, and the OCR text showed that the amounts were partly found while the pale labels were lost. Unlike blur (EXP-003, EXP-004), low contrast *can* be fixed by preprocessing.
+- **Pilot (6 Makro noise3 pages, fields correct of 36):** grayscale 1, global autocontrast 1, adaptive threshold 5, **CLAHE (clip 3.0, 16 × 16 tiles) 23**. On 6 clean pages every method scored 35/36, so CLAHE did not hurt clean pages.
+- **Full run:** `scripts/run_tesseract.py --preprocess clahe --engine-name tesseract-clahe` on both splits (700 images).
+
+| Split / level | total raw → CLAHE | cash | change | receipt no. | date | time |
+| --- | --- | --- | --- | --- | --- | --- |
+| Makro clean | 100% → 100% | 100% → 100% | 100% → 98% | 94% → 98% | 82% → 84% | 98% → 100% |
+| Makro noise1 (crumpled) | 84% → **68%** | 90% → **14%** | 84% → **0%** | 14% → 8% | 76% → 44% | 0% → 0% |
+| Makro noise2 | 86% → 74% | 90% → 80% | 66% → **8%** | 80% → 86% | 86% → 72% | 90% → 96% |
+| Makro noise3 (faded) | 0% → **84%** | 0% → **66%** | 0% → **52%** | 26% → **80%** | 10% → **70%** | 20% → **62%** |
+| Makro noise4 (blur) | 0% → **44%** | 0% → **50%** | 0% → 0% | 0% → 32% | 0% → 2% | 8% → 30% |
+| **Makro readable** | 54% → **74%** | 56% → 62% | 50% → **32%** | 43% → 61% | 51% → 54% | 43% → 58% |
+| Big C clean | 100% → 100% | 94% → **100%** | 100% → 100% | 100% → 100% | 100% → 100% | 100% → 100% |
+| Big C noise1 | 86% → 86% | 86% → 80% | 98% → 88% | 100% → 98% | 100% → 96% | 88% → **74%** |
+| Big C noise4 (blur) | 84% → 80% | 6% → 8% | 34% → **68%** | 34% → **58%** | 10% → 14% | 28% → 42% |
+| **Big C readable** | 93% → 92% | 75% → 76% | 85% → 90% | 86% → 90% | 82% → 80% | 81% → 78% |
+
+- **Passed where contrast was the problem:** Makro faded pages go from unreadable to mostly readable, and even the Makro blur level reaches 44% on total, which downscaling and segmentation modes could not do (EXP-012). On Big C, CLAHE also fixes the three clean `3` → `2` misreads from EXP-007.
+- **Failed where texture is the problem:** CLAHE amplifies local contrast everywhere, including the folds of crumpled paper. On Makro noise1, cash falls from 90% to 14% and change from 84% to 0%.
+- **Conclusion:** neither setting is better overall, and they fail on different images. That is the setup for EXP-014: run both and let the checks pick.
+- **Cost:** a second OCR pass doubles OCR time (Big C 1.0 s and Makro 4.0 s per image with CLAHE).
+
+## EXP-014: Two passes, the checks choose, and a bug fix
+
+- **Idea:** raw and CLAHE make *different* mistakes. Read each image twice and decide per field (`scripts/ensemble.py`):
+  - **Amounts:** a value confirmed by the arithmetic checks in either pass wins. If both passes confirm different values, the field is flagged. Otherwise the two passes must read the same value. Otherwise it is flagged.
+  - **Receipt no., date, time:** no arithmetic check exists, so the field is accepted only when both passes agree.
+- **Bug found while doing this.** In CLAHE Makro, 7 "confirmed" cash values and 7 "repaired" change values were wrong. Cause: in `check()`, when the items confirmed the total and change was missing, cash was marked *confirmed* and change derived from it, although nothing had checked cash. Example: `makro_noise2_06230`, cash read `980.00` (true `280.00`), so change was "repaired" to `932.00`. **Fix:** a value is confirmed only if a check that holds includes it. When only one of cash/change is read, it stays unchecked and the other is not derived. All 14 wrong values disappeared. Accepted amounts on Big C Tesseract went from 647 to 636, with still 1 wrong; the EXP-010 entry has a correction note.
+
+**Result: share of all receipts where the field is correct *and* accepted, and wrong values accepted (readable levels)**
+
+| Split | total | cash | change | receipt no. | date | time | wrong accepted |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Big C, two passes | 92% | 77% | 84% | 82% | 78% | 72% | **1** of 1,500 |
+| Makro, two passes | 66% | 60% | 55% | 38% | 38% | 42% | **6** of 1,500 |
+
+For comparison, single-pass Tesseract on Makro readable got total 54%, cash 56%, change 50%, and accepted every value it read, right or wrong.
+
+| Decision (both splits) | fields | correct |
+| --- | ---: | ---: |
+| confirmed by a check in either pass | 1,051 | 1,050 |
+| both passes agree | 1,001 | 988 |
+| flagged (asked) | 2,148 | — |
+
+- **Passed:** on Big C, the system accepts 92% of totals with one wrong value in 1,500 readable fields. On Makro it recovers faded and some blurred pages that one pass could not read, without the crumpled-page losses of CLAHE alone.
+- **Agreement is weaker than a check:** 13 wrong values passed because both passes made the *same* misread: 6 dates and 2 times (fields with no arithmetic check), and 5 amounts on receipts where no check could run. Two passes of the same engine are not fully independent.
+- **Cost of caution:** many fields are flagged (2,148 of 4,200), mostly on noise4–6, where at least one pass reads nothing. In an app that means "please check these fields", which is better than a wrong number but not free.
+- **Remaining wrong "confirmed" amount:** the correlated misread from EXP-012 (`3047` → `3007` in both total and cash), still 1 case.
+
+**Next:** use the two receipt-number copies and the two passes together (four reads) to vote on IDs and dates. Try a VLM on the blur levels, where both passes fail.
