@@ -60,9 +60,10 @@ Tesseract, 50 Makro A4 tax invoices per level, readable levels (clean–noise4).
 | Big C rules, unchanged (v3) | 0% | 56% | 0% | 37% | 0% | 36% | all read values |
 | Layout-aware rules (v4) | 54% | 56% | 50% | 43% | 51% | 43% | all read values |
 | v4 + CLAHE contrast | 74% | 62% | 32% | 61% | 54% | 58% | all read values |
-| **v4, two passes (raw + CLAHE), checks decide** | **66%** | **60%** | **55%** | 38% | 38% | 42% | **6 of 1,500** |
+| v4, two passes (raw + CLAHE), checks decide | 66% | 60% | 55% | 38% | 38% | 42% | 6 of 1,500 |
+| **+ voting on receipt no., date, time** | **66%** | **60%** | **55%** | **50%** | 38% | 42% | **6 of 1,500** |
 
-In the last row a value counts only if it is correct *and* accepted. Everything else goes back to the user to check.
+In the last two rows a value counts only if it is correct *and* accepted. Everything else goes back to the user to check. The same final setup on Big C: total 92%, cash 77%, change 84%, receipt no. 82%, date 78%, time 72%, and **0 wrong values accepted** in 1,500 readable fields ([EXP-015](EXPERIMENTS.md#exp-015-voting-on-fields-that-have-no-arithmetic-check)).
 
 ### Key findings
 
@@ -77,6 +78,8 @@ In the last row a value counts only if it is correct *and* accepted. Everything 
 9. **Preprocessing is not one-size-fits-all.** CLAHE contrast enhancement rescued faded Makro pages (total 0% → 84%) but wrecked crumpled ones (change 84% → 0%). Reading each image both ways and letting the checks choose kept most of the gain and accepted only 6 wrong values in 1,500 fields ([EXP-013](EXPERIMENTS.md#exp-013-clahe-contrast-preprocessing), [EXP-014](EXPERIMENTS.md#exp-014-two-passes-the-checks-choose-and-a-bug-fix)).
 10. **"Consistent" is not "correct".** One Makro receipt had the same digit misread in both total and cash, so cash − total = change still held. A check that subtracts two numbers cannot see an error they share. Also, a bug marked unchecked values as confirmed. It was invisible on Big C and only showed up on the second layout, which is one more reason to test on more than one layout.
 
+11. **Count independent reads, not reads.** A majority vote over four reads of the receipt number let *more* errors through (6 → 9), because two passes over the same printed copy repeat the same misread. Counting only agreement between the two *printed* copies, plus rejecting impossible dates and times (`2075`, `00:93`), raised Makro receipt numbers from 38% to 50% and brought Big C to zero wrong values accepted ([EXP-015](EXPERIMENTS.md#exp-015-voting-on-fields-that-have-no-arithmetic-check)).
+
 Every run, including the failed ones, is logged with its cause and the next step in **[EXPERIMENTS.md](EXPERIMENTS.md)**.
 
 ## Method
@@ -87,7 +90,7 @@ Every run, including the failed ones, is logged with its cause and the next step
 4. **Scoring.** `scripts/evaluate.py` counts a field as correct only on an exact match (amounts within 0.005 baht), per noise level, and reports readable levels (clean–noise4) separately from the stress test (noise5–6).
 5. **Quality gate.** `scripts/quality_gate.py` checks whether OCR confidence and image sharpness can flag failed images, or single wrong fields, before their numbers are trusted. The threshold is chosen on one half of the images and reported on the other half.
 6. **Cross-checks.** `scripts/cross_check.py` checks the amounts against each other (cash − total = change, sum of items = total, before-VAT + VAT = total on Makro, cash ≥ total, payable to 0.25 baht) and marks each one confirmed, repaired, flagged, or unchecked. Makro receipt numbers are printed twice, so the two copies are compared too.
-7. **Two passes.** `scripts/run_tesseract.py --preprocess clahe` reads each image again after contrast enhancement, and `scripts/ensemble.py` keeps, per field, a value a check confirmed in either pass, or one both passes agree on.
+7. **Two passes.** `scripts/run_tesseract.py --preprocess clahe` reads each image again after contrast enhancement, and `scripts/ensemble.py` keeps, per field, a value a check confirmed in either pass, or one both passes agree on. For receipt no., date and time (`--rule vote`), it also rejects impossible dates and times and accepts a Makro receipt number when its two printed copies match.
 
 ## Reproduce
 

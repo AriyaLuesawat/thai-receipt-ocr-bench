@@ -20,6 +20,7 @@ Scores are exact-match field accuracy on the Big C sample (50 receipts per noise
 | EXP-012 | 2026-11-15 | Extractor v4 (layout detection + Makro rules) and VAT/receipt-number checks | Partial pass: readable total 0% → 54%, clean 100%. Checks hold up on the new layout (3 wrong of 397 accepted), but 2 confirmed values were wrong: a correlated misread passes C1. |
 | EXP-013 | 2026-11-15 | CLAHE contrast preprocessing before Tesseract | Mixed: Makro faded total 0% → 84%, blur 0% → 44%, but crumpled change 84% → 0%. Helps some images, hurts others. |
 | EXP-014 | 2026-11-15 | Read every image twice (raw + CLAHE), let the checks choose. Plus a bug fix in the checks | Passed: Big C 1 wrong value accepted in 1,500 readable fields. Makro total 54% → 66%. Bug: cash was marked confirmed without any check (14 wrong values under CLAHE), now fixed. |
+| EXP-015 | 2026-11-15 | Vote on receipt no., date, time: possible-value rules + the two printed receipt-number copies | Passed: Makro readable receipt no. 38% → 50%, Big C readable wrong values 1 → 0, all-level wrong 14 → 11. First try (majority of 4 reads) failed: 6 → 9 wrong on Makro. |
 
 ---
 
@@ -408,3 +409,45 @@ For comparison, single-pass Tesseract on Makro readable got total 54%, cash 56%,
 - **Remaining wrong "confirmed" amount:** the correlated misread from EXP-012 (`3047` → `3007` in both total and cash), still 1 case.
 
 **Next:** use the two receipt-number copies and the two passes together (four reads) to vote on IDs and dates. Try a VLM on the blur levels, where both passes fail.
+
+## EXP-015: Voting on fields that have no arithmetic check
+
+- **Problem (from EXP-014):** receipt no., date and time were accepted only when both passes read the same value. 8 of those agreed values were wrong, and on Makro only 38% of receipt numbers were accepted, although the number is printed twice on every invoice.
+- **Look at the 8 wrong values first.** 5 are values no receipt can carry: years `2005` and `2075` (true `2025`), day `00`, time `00:93`. The other 3 are possible but wrong: `22/08` for `28/08`, `10/09` for `14/09`, `00:14` for `20:21`.
+
+**Attempt 1: majority vote over 4 reads (failed).** Pool every read of the receipt number (2 printed copies × 2 passes) and accept the most common value with at least 2 votes.
+
+- Makro receipt no. accepted rose (readable 38% → 50%), but wrong values accepted rose too, 6 → 9 (all levels).
+- **Why it failed:** the two passes read the *same* printed copy from the same pixels, so they repeat the same misread. Example, `makro_noise2_06233`: reads `650432437268`, `650432437265`, `654432437268`, `650432437268`. The two copies of `650…268` are one copy read twice (raw and CLAHE), and they beat the correct `654…268`. Votes are only worth counting when they are independent.
+
+**Attempt 2: count independent evidence only (passed).** `scripts/ensemble.py --rule vote`:
+
+1. **Possible values only:** a real calendar date with year 2020–2026, a time with hh < 24 and mm < 60.
+2. **Makro receipt no.:** if the two *printed copies* read the same in either pass, that value wins (two print locations are close to independent). If two passes confirm different values, ask the user.
+3. Otherwise, as before: both passes extract the same value → accepted, else flagged.
+
+**Result (wrong values accepted; correct and accepted in readable levels)**
+
+| Split | rule | receipt no. | date | time | wrong, readable | wrong, all levels |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Big C | agree (EXP-014) | 82% | 78% | 72% | 1 | 5 |
+| Big C | **vote** | 82% | 78% | 72% | **0** | **3** |
+| Makro | agree (EXP-014) | 38% | 38% | 42% | 6 | 9 |
+| Makro | majority of 4 reads (attempt 1) | 50% | 38% | 42% | 9 | 11 |
+| Makro | **vote** | **50%** | 38% | 42% | 6 | **8** |
+
+| Decision (both splits, all levels) | fields | correct |
+| --- | ---: | ---: |
+| confirmed by a check in either pass | 1,051 | 1,050 |
+| agreed / voted | 1,027 | 1,017 |
+| flagged (asked) | 2,122 | — |
+
+- **Passed:** the possible-value rules removed the impossible dates and times without losing any correct value. The printed-copy rule raised Makro receipt numbers accepted on readable pages from 38% to 50% with no new wrong values on readable levels. Big C now accepts no wrong value at all in 1,500 readable fields.
+- **Still wrong (11 of 2,078 accepted, all levels):**
+  - 2 Makro receipt numbers on blurred pages (noise4–5) where the CLAHE pass misread the *same digit in both copies* (`8` → `0`, `8` → `2`): the same font blurred the same way gives the same error, so even two print locations are not fully independent under blur.
+  - 3 possible-but-wrong dates and times (above). Nothing on the page can check them.
+  - 6 amounts, mostly on noise5 where no arithmetic check could run.
+- **Lesson:** the number of reads does not matter; the number of *independent* reads does. Two passes over the same pixels count as about one read.
+
+**Next:** make the pipeline usable outside the benchmark: an API that takes a photo and returns each field with its status (EXP-016).
+

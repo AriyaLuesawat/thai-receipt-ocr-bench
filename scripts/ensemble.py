@@ -10,18 +10,30 @@ checks decide, per field:
     2. otherwise, both passes reading the same value counts as agreement
     3. otherwise the field is flagged and the user is asked
   receipt no., date, time (no arithmetic check exists):
-    both passes agree -> accepted; otherwise flagged
+    --rule agree (EXP-014): both passes extract the same value -> accepted; otherwise flagged
+    --rule vote  (EXP-015):
+      - the value must be possible: a real calendar date in 2020-2026, a time with hh < 24
+        and mm < 60 (catches 5 of the 8 agreed-but-wrong reads of EXP-014)
+      - Makro receipt no.: printed twice on the page. If, in either pass, the two printed
+        copies read the same, that value wins (two different print locations are close to
+        independent). Pooling all 4 reads and taking the majority was tried first and let
+        more errors through: two passes over the same copy share its pixels, so they repeat
+        the same misread (wrong accepted 6 -> 9)
+      - otherwise: both passes extract the same value -> accepted; else flagged
 
 Run evaluate.py and cross_check.py for both engines first.
 """
 
 import argparse
 import csv
-from collections import defaultdict
+import datetime
+import json
+import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
-from evaluate import is_stress, level_key
-from extract import FIELDS
+from evaluate import canonical_label, correct, is_stress, level_key
+from extract import DIGIT_FIX_V2, FIELDS, is_makro, item_lines, thai_normalise
 
 ROOT = Path(__file__).resolve().parent.parent
 AMOUNTS = ["total", "cash", "change"]
@@ -52,19 +64,60 @@ def combine_amount(a: dict, b: dict, f: str) -> tuple[str, int | None]:
     return "flagged", None
 
 
+def possible(field: str, value: str) -> bool:
+    """Reject values no real receipt can carry (EXP-015: 5 of 8 agreed-but-wrong reads)."""
+    if field == "receipt_date":
+        try:
+            d = datetime.datetime.strptime(value, "%d/%m/%Y").date()
+        except ValueError:
+            return False
+        return 2020 <= d.year <= 2026
+    if field == "receipt_time":
+        m = re.fullmatch(r"(\d{2}):(\d{2})", value)
+        return bool(m) and int(m.group(1)) < 24 and int(m.group(2)) < 60
+    return True
+
+
+def copies(raw: dict | None) -> list[str]:
+    """All 12-digit receipt-number copies on a Makro page (empty for other layouts)."""
+    if raw is None:
+        return []
+    lines = [thai_normalise(l) for l in item_lines(raw)]
+    if not is_makro(lines):
+        return []
+    return re.findall(r"(?<![\d-])(\d{12})(?![\d-])", "\n".join(lines).translate(DIGIT_FIX_V2))
+
+
+def vote(field: str, va: str, vb: str, raw_a: dict | None, raw_b: dict | None) -> str | None:
+    """Accepted value for a field without an arithmetic check, or None (ask the user)."""
+    if field == "receipt_no":
+        twice = {v for page in (copies(raw_a), copies(raw_b)) for v, n in Counter(page).items() if n >= 2}
+        if len(twice) == 1:
+            return twice.pop()
+        if len(twice) > 1:
+            return None
+    if same(va, vb) and possible(field, va):
+        return va
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--split", default="bigc")
     parser.add_argument("--engines", nargs=2, default=["tesseract", "tesseract-clahe"])
     parser.add_argument("--extractor", default="rules_v4")
+    parser.add_argument("--rule", choices=["agree", "vote"], default="vote", help="rule for fields without an arithmetic check")
     args = parser.parse_args()
 
     def load(engine: str, name: str) -> dict:
         path = ROOT / "results" / engine / args.split / name
         return {r["file"]: r for r in csv.DictReader(path.open(encoding="utf-8"))}
 
+    truth = {json.loads(l)["file"]: canonical_label(json.loads(l)["label"]) for l in (ROOT / "data" / args.split / "labels.jsonl").open(encoding="utf-8")}
     checks = [load(e, "cross_check.csv") for e in args.engines]
     images = [load(e, "per_image.csv") for e in args.engines]
+    raws = [{json.loads(l)["file"]: json.loads(l) for l in (ROOT / "results" / e / args.split / "raw.jsonl").open(encoding="utf-8")}
+            for e in args.engines] if args.rule == "vote" else [{}, {}]
     files = sorted(set(checks[0]) & set(checks[1]))
 
     # decisions[level][field] -> list of (decision, correct)
@@ -78,10 +131,17 @@ def main() -> None:
                 continue
             a, b = images[0][file], images[1][file]
             va, vb = a[f"{args.extractor}:{f}"], b[f"{args.extractor}:{f}"]
-            decisions[level][f].append(("agree", int(a[f"{args.extractor}:{f}:ok"])) if same(va, vb) else ("flagged", None))
+            if args.rule == "agree":
+                decisions[level][f].append(("agree", int(a[f"{args.extractor}:{f}:ok"])) if same(va, vb) else ("flagged", None))
+                continue
+            winner = vote(f, va, vb, raws[0].get(file), raws[1].get(file))
+            if winner is None:
+                decisions[level][f].append(("flagged", None))
+            else:
+                decisions[level][f].append(("agree", int(correct(f, winner, truth[file].get(f)))))
 
     levels = sorted(decisions, key=level_key)
-    print(f"split={args.split}  engines={' + '.join(args.engines)}")
+    print(f"split={args.split}  engines={' + '.join(args.engines)}  rule={args.rule}")
     print("Correct and accepted (share of all receipts) / wrong values accepted\n")
     print("| level | " + " | ".join(FIELDS) + " | wrong accepted |\n|---|" + "---:|" * (len(FIELDS) + 1))
     groups = [(l, [l]) for l in levels] + [("READABLE", [l for l in levels if not is_stress(l)]), ("ALL", levels)]
