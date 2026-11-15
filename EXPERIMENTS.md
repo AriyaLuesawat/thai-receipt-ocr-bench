@@ -461,7 +461,7 @@ For comparison, single-pass Tesseract on Makro readable got total 54%, cash 56%,
   - `tests/test_pipeline.py` runs the per-image pipeline on the stored OCR of all 700 benchmark images. Every amount gets the same decision as `ensemble.py`, and scoring the pipeline's accepted values against the labels gives exactly EXP-015's wrong counts (3 on Big C, 8 on Makro).
   - Unit tests pin the rules that earlier bugs broke: a lone cash value must stay unchecked (EXP-014), unpayable values, cash below total, impossible dates and times. 17 tests pass.
 - **API** (`app/main.py`): `POST /read` takes an image and returns each field with `value`, `status` (`verified`, `agreed`, `needs_review`) and `candidates` (what each pass read, for the user to choose from). `GET /health` reports the Tesseract version and whether the Thai model is installed. `GET /` is a small upload page that shows the statuses and lets the user correct flagged fields.
-- **Input safety:** uploads over 10 MB or with a side over 4,000 px are refused (413); bytes that do not decode as an image are refused (415). The image is decoded and re-encoded with OpenCV before Tesseract sees it, processed in a temporary folder, and deleted after the response. The log keeps only layout, time and status counts, never field values.
+- **Input safety:** uploads over 10 MB or over 100 megapixels are refused (413); bytes that do not decode as an image are refused (415). The image is decoded and re-encoded with OpenCV before Tesseract sees it, processed in a temporary folder, and deleted after the response. The log keeps only layout, time and status counts, never field values.
 
 **Latency** (through HTTP, 3 images per noise level, Apple M5 CPU, both passes in parallel)
 
@@ -474,6 +474,8 @@ For comparison, single-pass Tesseract on Makro readable got total 54%, cash 56%,
 - **Not done yet:**
   - The `Dockerfile` (for a Hugging Face Docker Space) has not been built: Docker is not installed on this machine. Debian ships Tesseract 5.3 while the benchmark used 5.5.4, so the scores must be rechecked inside the image before quoting them for the deployed version.
   - No real phone photos have gone through it. Real photos are rotated, cropped and lit unevenly, which the synthetic data does not cover.
+
+- **First real use failed:** the first phone photo was refused with `image side longer than 4000 px`. Phone cameras take 4,000+ px photos (e.g. 4032 × 3024), so the limit, set with the benchmark images in mind, blocked the main real-world input. **Fix:** photos are now scaled down to a 3,500 px long side (the size of the Makro A4 pages, 3508 px, which Tesseract read well) instead of refused, and only images over 100 megapixels are rejected. A test now sends a 4032 × 3024 photo. Lesson: limits must be set from the real inputs, not from the test set.
 
 **Next:** build and deploy the image, then feed it real receipts and log the results as a new split.
 

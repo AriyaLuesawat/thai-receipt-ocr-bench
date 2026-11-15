@@ -2,7 +2,7 @@
 
   GET  /         upload page (app/static/index.html)
   GET  /health   Tesseract version and whether the Thai model is installed
-  POST /read     multipart "file" (JPEG/PNG/WebP, max 10 MB) -> fields with a status each
+  POST /read     multipart "file" (JPEG/PNG/WebP, max 10 MB; photos over 3,500 px are scaled down) -> fields with a status each
 
 Images are processed in a temporary directory and deleted after the response; nothing
 is stored or logged except timing and the status counts.
@@ -29,7 +29,8 @@ from pipeline import read_receipt  # noqa: E402
 from run_tesseract import TESSDATA  # noqa: E402
 
 MAX_BYTES = 10 * 1024 * 1024
-MAX_SIDE = 4000
+MAX_PIXELS = 100_000_000  # refuse only absurd sizes (decompression bombs)
+TARGET_SIDE = 3500  # phone photos are scaled down to this long side: the Makro A4 pages (300 dpi) are 3508 px
 log = logging.getLogger("receipt-api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 app = FastAPI(title="Thai receipt reader", version="0.1.0")
@@ -59,8 +60,12 @@ def read(file: UploadFile) -> dict:
     image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise HTTPException(415, "not a readable JPEG, PNG or WebP image")
-    if max(image.shape[:2]) > MAX_SIDE:
-        raise HTTPException(413, f"image side longer than {MAX_SIDE} px")
+    h, w = image.shape[:2]
+    if h * w > MAX_PIXELS:
+        raise HTTPException(413, "image larger than 100 megapixels")
+    if max(h, w) > TARGET_SIDE:
+        scale = TARGET_SIDE / max(h, w)
+        image = cv2.resize(image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
     start = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "receipt.png"

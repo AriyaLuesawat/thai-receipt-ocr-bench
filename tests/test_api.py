@@ -47,3 +47,9 @@ def test_clean_bigc_receipt():
         pytest.skip("sample not downloaded")
     fields = client.post("/read", files={"file": (image.name, image.read_bytes(), "image/jpeg")}).json()["fields"]
     assert fields["total"]["status"] == "verified"
+
+
+def test_large_photo_is_scaled_not_refused():
+    ok, jpg = cv2.imencode(".jpg", np.full((4032, 3024, 3), 255, np.uint8))
+    r = client.post("/read", files={"file": ("photo.jpg", jpg.tobytes(), "image/jpeg")})
+    assert r.status_code == 200
